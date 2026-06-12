@@ -55,9 +55,6 @@ KEY_SOURCES = [
     ("POWERMEM_INIT_LLM_API_KEY", None),
     ("ANTHROPIC_AUTH_TOKEN",       "anthropic"),
     ("ANTHROPIC_API_KEY",          "anthropic"),
-    ("OPENAI_API_KEY",             "openai"),
-    ("DEEPSEEK_API_KEY",           "deepseek"),
-    ("DASHSCOPE_API_KEY",          "qwen"),
 ]
 api_key = ""
 key_provider = ""
