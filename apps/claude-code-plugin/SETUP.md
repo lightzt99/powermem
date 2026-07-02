@@ -638,6 +638,95 @@ injection, set POWERMEM_PROMPT_SEARCH=0. The hook talks to POWERMEM_BASE_URL
 
 For the full manual reference, see ../../docs/integrations/claude_code.md
 
+## Remote primary + local fallback (dual backend)
+
+When you configure a remote PowerMem server as the primary, the hook can
+transparently fall back to a local server when the remote is unreachable
+(network error, timeout, or HTTP 5xx). This keeps memory writes and
+searches working during remote outages.
+
+### Configuration
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `POWERMEM_BASE_URL` | Primary (remote) backend URL | `http://localhost:8848` |
+| `POWERMEM_API_KEY` | Primary API key | empty |
+| `POWERMEM_FALLBACK_BASE_URL` | Fallback backend URL. Empty = single-backend mode (today's behaviour) | empty |
+| `POWERMEM_FALLBACK_API_KEY` | Fallback API key | empty |
+| `POWERMEM_FALLBACK_DISABLED` | `1`/`true` runtime kill switch — decays to primary-only without rewriting runtime.env | `0` |
+| `POWERMEM_FALLBACK_DOWN_TTL_SECONDS` | How long to trust "primary down" state and skip probing (5–300) | `30` |
+| `POWERMEM_FALLBACK_UP_TTL_SECONDS` | How long to trust "primary up" state and skip probing (5–300) | `30` |
+| `POWERMEM_FALLBACK_TRIGGER_5XX` | `1` (default) treats HTTP 5xx as a fallback trigger; `0` only falls back on network/timeout | `1` |
+| `POWERMEM_FALLBACK_LOG_FILE` | Where fallback events are logged (JSON lines) | `$DATA_DIR/powermem-hook.log` |
+| `POWERMEM_INIT_FALLBACK_BASE_URL` | init.sh non-interactive flag to configure fallback at setup time | empty |
+
+### Setup
+
+Non-interactive — set both before running init:
+
+```bash
+POWERMEM_INIT_BASE_URL=https://remote.example.com:8848 \
+POWERMEM_INIT_FALLBACK_BASE_URL=http://localhost:8849 \
+sh "$CLAUDE_PLUGIN_ROOT/scripts/init.sh"
+```
+
+If the fallback URL is local and no healthy server is listening there,
+init prints a reminder to start one separately:
+
+```bash
+POWERMEM_INIT_BASE_URL=http://localhost:8849 sh "$CLAUDE_PLUGIN_ROOT/scripts/init.sh"
+```
+
+Interactive — when stdin is a TTY and `POWERMEM_INIT_FALLBACK_BASE_URL` is
+unset, init asks `Enable local fallback server for remote outages? [y/N]`.
+Answering `y` defaults the fallback to `http://localhost:8849`.
+
+### Fallback trigger criteria
+
+| Failure mode | Triggers fallback? |
+|---|---|
+| Connection refused / DNS / TLS / connection reset | Yes |
+| Client timeout (`context.DeadlineExceeded`) | Yes |
+| HTTP 5xx (when `POWERMEM_FALLBACK_TRIGGER_5XX=1`, default) | Yes |
+| HTTP 5xx (when `POWERMEM_FALLBACK_TRIGGER_5XX=0`) | No — error surfaces as-is |
+| HTTP 4xx | No — a different backend won't fix auth/validation errors |
+| HTTP 2xx | No — success |
+
+### State file
+
+The hook is a fresh process per event, so circuit-breaker state is persisted
+to `~/.powermem/fallback-state.json`:
+
+```json
+{"primary_down": true, "last_probe_at": "2026-07-01T12:00:00Z"}
+```
+
+When `primary_down=true` and the last probe is within
+`POWERMEM_FALLBACK_DOWN_TTL_SECONDS`, the hook skips the primary probe and
+goes straight to fallback. When `primary_down=false` and within
+`POWERMEM_FALLBACK_UP_TTL_SECONDS`, it goes straight to primary. Otherwise
+it probes primary and updates state.
+
+### Known limitations (v1)
+
+- **No replication.** Memories written to the fallback during an outage are
+  **not** automatically replayed to the primary after recovery. The two
+  backends diverge until you manually reconcile. Replay is planned for a
+  follow-up.
+- **Stale reads.** Searches during fallback read from the local backend,
+  which may lag behind the remote.
+- **No conflict resolution.** If both backends receive writes independently
+  (e.g. primary was up but a transient error caused one fallback write),
+  there is no automatic deduplication.
+- **MCP transport not covered.** Fallback applies to the hook's REST calls
+  only, not to MCP server transport.
+
+### Kill switch
+
+If fallback is misbehaving, set `POWERMEM_FALLBACK_DISABLED=1` in the
+environment (or in Claude Code's `env` field) to instantly decay to
+single-backend primary-only mode without editing `runtime.env`.
+
 
 ## 🚨 COMPREHENSIVE ERROR HANDLING GUIDE
 
@@ -706,42 +795,17 @@ data loss is acceptable.
 #### [E006] Model Download Timeout
 **Problem**: Server hangs or reports "timed out thrown while requesting HEAD" on startup.
 **Cause**: The embedding model is not cached and the network is unreachable.
-**Fix**: Follow the model pre-download step in Step 3a (branch on region detected in
-Step 1a). Quick reference:
-
-**CN region** (ModelScope → HF hub bridge):
+**Fix**: Run the preloader script, which auto-detects region (CN → ModelScope with
+HuggingFace hub-cache bridge; non-CN → HuggingFace direct) and uses the same
+interpreter `powermem-server` runs under:
 ```bash
-# Detect the correct interpreter first (same one powermem uses):
-POWERMEM_PYTHON=$(head -1 "$(command -v powermem-server)" | sed 's|#!||;s| .*||')
-uv pip install --python "$POWERMEM_PYTHON" modelscope
-$POWERMEM_PYTHON -c "from modelscope import snapshot_download; \
-                     snapshot_download('AI-ModelScope/all-MiniLM-L6-v2')"
-# Verify (note: models/ subdirectory is required):
-ls ~/.cache/modelscope/hub/models/AI-ModelScope/all-MiniLM-L6-v2/
+sh "$CLAUDE_PLUGIN_ROOT/scripts/preload-model.sh"
 ```
+The script reads `POWERMEM_MODELSCOPE_PACKAGE` (defaults to `modelscope`) if you
+need to override it. Do NOT use `sentence_transformers.SentenceTransformer(...)`
+to download — it can hang on networks where HuggingFace is unreachable.
 
-**Non-CN region** (HuggingFace direct):
-```bash
-POWERMEM_PYTHON=$(head -1 "$(command -v powermem-server)" | sed 's|#!||;s| .*||')
-uv pip install --python "$POWERMEM_PYTHON" huggingface_hub
-$POWERMEM_PYTHON -c "from huggingface_hub import snapshot_download; \
-                     snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"
-# Verify:
-ls ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/
-```
-⚠️ Do NOT use bare `python` here — on many systems the default `python` version is below 3.11.
-Using the shebang from `powermem-server` guarantees all three steps (uv install, download,
-bridge) run in the same environment.
-Then run the bridge script from Step 3a to populate the HuggingFace hub cache
-structure — the embedder's cache-detection function checks `~/.cache/huggingface/hub/`,
-not the ModelScope layout.
-
-⚠️ **DO NOT** use `sentence_transformers.SentenceTransformer(...)` to download — it can
-hang on networks where HuggingFace is unreachable. On CN region, use ModelScope +
-HF hub bridge. On non-CN region, use `huggingface_hub.snapshot_download`. Always
-check region first (Step 1a).
-
-To confirm which sources are reachable:
+To confirm which sources are reachable before running the preloader:
 ```bash
 curl -s -m 10 -o /dev/null -w "ModelScope: HTTP %{http_code}\n" \
   https://www.modelscope.cn/api/v1/models/AI-ModelScope/all-MiniLM-L6-v2
@@ -867,86 +931,6 @@ python -c "import pyobvector" 2>&1   # should produce no output
 python -c "import pyseekdb" 2>&1    # should produce no output
 ```
 
-## PRE-CHECK & PREREQUISITES
-
-1. **Verify Python version**: `python3 --version` (must be >= 3.11, see [E011])
-2. **Verify uv**: `uv --version` (install it with [E012] if missing)
-3. **Verify hook binaries**: committed `hooks/bin/` binaries should already be present;
-   Go 1.22+ is only needed when refreshing them from hook source changes.
-4. **Check mirror access**: if using an internal mirror, verify
-   it has `pyobvector`, `pyseekdb`, and `onnxruntime`; see [E013] if not.
-
-## STEP BY STEP PROVEN PATH
-
-Given the encountered errors, here are the tested workarounds for each approach:
-
-### Method A: SOURCE Path (Current Directory Build)
-```bash
-# Create virtual environment to avoid PEP 668 issues.
-uv venv venv --python python3.11
-source venv/bin/activate
-POWERMEM_PYTHON="$VIRTUAL_ENV/bin/python"
-
-# Install everything with ALL required extras
-uv pip install --python "$POWERMEM_PYTHON" -e '.[server,seekdb]'
-
-# Git/marketplace installs use committed hook binaries.
-# Optional after hook source changes:
-# make build-claude-hook
-
-# Register marketplace
-DEST="$HOME/.claude/marketplaces/powermem"
-mkdir -p "$DEST"
-rsync -a --delete "$(pwd)/apps/claude-code-plugin/" "$DEST/"
-claude plugin marketplace add "$DEST"
-claude plugin install memory-powermem@powermem --scope user
-
-# Start server (logs go to server.log automatically)
-powermem-server --host 0.0.0.0 --port 8848 &
-```
-
-### Method B: PYPI/MCP Path (Recommended for Stability)
-```bash
-# Clean virtual environment approach
-uv venv venv --python python3.11
-source venv/bin/activate
-POWERMEM_PYTHON="$VIRTUAL_ENV/bin/python"
-uv pip install --python "$POWERMEM_PYTHON" 'powermem[server,seekdb]'
-claude mcp remove powermem 2>/dev/null
-claude mcp add powermem -- powermem-mcp stdio
-```
-
-### Method C: Troubleshooting Installation
-```bash
-# Common troubleshooting commands
-lsof -i :8848    # Check if port is in use
-pkill -f powermem-server  # Kill any running server
-rm -rf seekdb_data  # Reset SeekDB if corrupted and data loss is acceptable
-
-# Check logs
-tail -f server.log                    # PowerMem server errors
-tail -f seekdb_data/log/seekdb.log    # SeekDB engine errors
-```
-
-## FINAL VALIDATION STEPS
-
-After setup, verify the complete round-trip:
-
-```bash
-# 1. Health check
-curl -s http://localhost:8848/api/v1/system/health
-
-# 2. Write test memory
-curl -s -X POST http://localhost:8848/api/v1/memories \
-  -H 'Content-Type: application/json' \
-  -d '{"content":"PowerMem setup verification complete","user_id":"setup_test"}'
-
-# 3. Search test
-curl -s -X POST http://localhost:8848/api/v1/memories/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"setup verification","user_id":"setup_test","limit":1}'
-```
-
 ## SYSTEMD AUTOSTART (Optional)
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -970,29 +954,3 @@ systemctl --user daemon-reload
 systemctl --user enable powermem.service
 systemctl --user start powermem.service
 ```
-
-## SUMMARY
-
-**Path taken**: **[Based on observed errors, recommend PYPI/MCP approach for stability]**
-- **.env location**: $(pwd)/.env
-- **Virtual environment**: $(pwd)/venv  
-- **Plugin marketplace**: ~/.claude/marketplaces/powermem
-- **Server URL**: http://localhost:8848
-- **Memory system**: seekdb storage with HTTP hooks
-- **Global enablement**: Complete via `claude plugin install`
-- **Usage**: Run `claude` command with no extra flags needed
-
-**Quick commands for daily use**:
-```bash
-# Start server
-source venv/bin/activate
-powermem-server --host 0.0.0.0 --port 8848
-
-# Check status
-systemctl --user status powermem.service
-
-# Quick restart
-ps aux | grep powrmem
-```
-
-Your Claude Code is now configured with automatic memory recall and persistence worldwide.
